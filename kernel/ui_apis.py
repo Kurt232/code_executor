@@ -1159,7 +1159,7 @@ class ElementList:
     self.check_last_screen_html()
     self.check_action_count()
     
-  def tap(self, button_api):
+  def tap(self, button_api=None):
     frame = inspect.currentframe()
     caller_frame = frame.f_back
     lineno = caller_frame.f_lineno
@@ -1171,6 +1171,8 @@ class ElementList:
         }
     
     action_type = 'touch'
+    if not button_api:
+      self.verifier._execute_action(self.api_name, self.element_list_xpath, statement, action_type)
     api_name, xpath = self.check_api(button_api, action_type, statement)
     self._execute_action(api_name, xpath, statement, action_type)
 
@@ -1186,10 +1188,12 @@ class ElementList:
         }
     
     action_type = 'long_touch'
+    if not button_api:
+      self.verifier._execute_action(self.api_name, self.element_list_xpath, statement, action_type)
     api_name, xpath = self.check_api(button_api, action_type, statement)
     self._execute_action(api_name, xpath, statement, action_type)
 
-  def set_text(self, input_api, text):
+  def set_text(self, text, input_api=None):
     frame = inspect.currentframe()
     caller_frame = frame.f_back
     lineno = caller_frame.f_lineno
@@ -1201,6 +1205,8 @@ class ElementList:
         }
     
     action_type = 'set_text'
+    if not input_api:
+      self.verifier._execute_action(self.api_name, self.element_list_xpath, statement, action_type, text)
     api_name, xpath = self.check_api(input_api, action_type, statement, text)
     self._execute_action(api_name, xpath, statement, action_type, text)
 
@@ -1219,29 +1225,32 @@ class ElementList:
         }
     
     action_type = 'get_text'
-    if isinstance(element_selector, str):
-      element_selector_name = element_selector.split('$')[-1]
-      try:
-        element_selector_xpath = self.api_xpaths[element_selector_name]
-      except KeyError:
-        _save2log( # save crash in get_and_navigate_target_element
-            save_path=self.save_path,
-            log_file=self.config.log_file,
-            element_tree=self.element_tree,
-            idx=None,
-            inputs=None,
-            action_type=action_type,
-            api_name=element_selector_name,
-            xpath=None,
-            currently_executing_code=statement,
-            comment='crashed',
-            screenshot=self.state.pixels.copy())
-        raise APIError(f'Invalid {element_selector_name}', element_selector_name)
+    if not element_selector:
+      target_ele = self.verifier.get_and_navigate_target_element(self.api_name, self.element_list_xpath, statement)
     else:
-      element_selector_name = element_selector.api_name if element_selector.api_name else element_selector.element_list_xpath
-      element_selector_xpath = element_selector.element_list_xpath
-    
-    target_ele = self.find_target_element_in_group(element_selector_name, element_selector_xpath, 'get_text', statement)
+      if isinstance(element_selector, str):
+        element_selector_name = element_selector.split('$')[-1]
+        try:
+          element_selector_xpath = self.api_xpaths[element_selector_name]
+        except KeyError:
+          _save2log( # save crash in get_and_navigate_target_element
+              save_path=self.save_path,
+              log_file=self.config.log_file,
+              element_tree=self.element_tree,
+              idx=None,
+              inputs=None,
+              action_type=action_type,
+              api_name=element_selector_name,
+              xpath=None,
+              currently_executing_code=statement,
+              comment='crashed',
+              screenshot=self.state.pixels.copy())
+          raise APIError(f'Invalid {element_selector_name}', element_selector_name)
+      else:
+        element_selector_name = element_selector.api_name if element_selector.api_name else element_selector.element_list_xpath
+        element_selector_xpath = element_selector.element_list_xpath
+      
+      target_ele = self.find_target_element_in_group(element_selector_name, element_selector_xpath, 'get_text', statement)
     
     _save2log(
         save_path=self.save_path,
@@ -1276,29 +1285,32 @@ class ElementList:
         }
     
     action_type = 'get_attributes'
-    if isinstance(element_selector, str):
-      element_selector_name = element_selector.split('$')[-1]
-      try:
-        element_selector_xpath = self.api_xpaths[element_selector_name]
-      except KeyError:
-        _save2log( # save crash in get_and_navigate_target_element
-            save_path=self.save_path,
-            log_file=self.config.log_file,
-            element_tree=self.element_tree,
-            idx=None,
-            inputs=None,
-            action_type=action_type,
-            api_name=element_selector_name,
-            xpath=None,
-            currently_executing_code=statement,
-            comment='crashed',
-            screenshot=self.state.pixels.copy())
-        raise APIError(f'Invalid {element_selector_name}', element_selector_name)
+    if not element_selector:
+      target_ele = self.verifier.get_and_navigate_target_element(self.api_name, self.element_list_xpath, statement)
     else:
-      element_selector_name = element_selector.api_name if element_selector.api_name else element_selector.element_list_xpath
-      element_selector_xpath = element_selector.element_list_xpath
-    
-    target_ele = self.find_target_element_in_group(element_selector_name, element_selector_xpath, 'get_attributes', statement)
+      if isinstance(element_selector, str):
+        element_selector_name = element_selector.split('$')[-1]
+        try:
+          element_selector_xpath = self.api_xpaths[element_selector_name]
+        except KeyError:
+          _save2log( # save crash in get_and_navigate_target_element
+              save_path=self.save_path,
+              log_file=self.config.log_file,
+              element_tree=self.element_tree,
+              idx=None,
+              inputs=None,
+              action_type=action_type,
+              api_name=element_selector_name,
+              xpath=None,
+              currently_executing_code=statement,
+              comment='crashed',
+              screenshot=self.state.pixels.copy())
+          raise APIError(f'Invalid {element_selector_name}', element_selector_name)
+      else:
+        element_selector_name = element_selector.api_name if element_selector.api_name else element_selector.element_list_xpath
+        element_selector_xpath = element_selector.element_list_xpath
+      
+      target_ele = self.find_target_element_in_group(element_selector_name, element_selector_xpath, 'get_attributes', statement)
     
     _save2log(
         save_path=self.save_path,
