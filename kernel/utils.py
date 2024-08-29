@@ -879,10 +879,7 @@ def convert_action(action_type: str, ele: EleAttr, text: str=None):
 
   action_details = {"action_type": "wait"}
   if action_type in ["touch", "long_touch", "set_text"]:
-    x, y = ele.ele.bbox_pixels.center
-    x, y = int(x), int(y)
-    action_details['x'] = x
-    action_details['y'] = y
+    action_details['index'] = ele.local_id
     if action_type == "touch":
       action_details["action_type"] = "click"
     elif action_type == "long_touch":

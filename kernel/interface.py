@@ -67,7 +67,7 @@ class AsyncEnv(abc.ABC):
     """
 
   @abc.abstractmethod
-  def execute_action(self, target_ele: EleAttr, **action_kwargs) -> None:
+  def execute_action(self, action: dict) -> None:
     """Executes action on the environment."""
 
   @property
@@ -221,7 +221,7 @@ class AsyncMockEnv(AsyncEnv):
     """
     return self.ui_state_sequence[self.current_state_index]
 
-  def execute_action(self, target_ele: EleAttr, **action_kwargs) -> None:
+  def execute_action(self, action: dict) -> None:
     """Executes action on the environment."""
     # todo:: check the action
     # if action is valid, then update the state index

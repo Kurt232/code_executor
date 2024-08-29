@@ -9,7 +9,7 @@ import datetime
 
 from absl import logging
 
-from kernel.utils import ElementTree, EleAttr, convert_action
+from kernel.utils import ElementTree, EleAttr, convert_action, save_screenshot
 from kernel import interface
 from kernel.api_doc import ApiDoc
 from kernel.err import XPathError, APIError, ActionError, NotFoundError
@@ -224,6 +224,8 @@ class CodeConfig:
     self.line_mappings = line_mappings
     self.code_lines = code.split('\n')
     self.compiled_code_lines = compiled_code.split('\n')
+    
+    self.enable_dependency = True
 
 
 class CodeStatus:
@@ -311,13 +313,16 @@ class Verifier:
     is_same = self.status.check_last_screen(self.element_tree.str)
     return is_same
 
-  def scroll_and_find_target_ele(self,
+  def find_and_scroll_target_ele(self,
                                  xpath,
                                  statement,
                                  direction='DOWN'):
-    all_ele_descs_during_scrolling = []
-
     element_tree = self.element_tree
+    # try find the target element in the current UI
+    target_ele = element_tree.get_ele_by_xpath(xpath)
+    if target_ele:
+      return target_ele
+    all_ele_descs_during_scrolling = []
     for ele_id in element_tree.scrollable_ele_ids:
       origin_ele = element_tree.ele_map[ele_id]
       ele_properties_without_idx = {
@@ -377,245 +382,195 @@ class Verifier:
             break
     return None
 
-  def execute_action(self, ele_data: dict):
-    logging.info(f'execute action: {ele_data}')
-    code_to_be_executed = ele_data
-
-    state = self.state
-    element_tree = self.element_tree
-    # first execute the code
-    api_name = code_to_be_executed['api_name']
+  def get_and_navigate_target_element(self, api_name, xpath, statement):
+    # try find the target element in the current UI and scroll down screen
+    target_ele = self.find_and_scroll_target_ele(xpath, statement)
     
-    xpath = code_to_be_executed['xpath']
-    action_type = code_to_be_executed['action_type']
-    text = code_to_be_executed['text']
-    statement = code_to_be_executed['statement']
-    
-    # try find the target element in the current UI
-    target_ele = element_tree.get_ele_by_xpath(xpath)
-    
-    # avoid the target element is in the bottom of the screen
-    if action_type == 'set_text' and target_ele:
-      _, y = target_ele.ele.bbox_pixels.center
-      width, height = self.env.logical_screen_size
-      
-      if y >= 0.9 * height:
-        _save2log(
-            save_path=self.save_path,
-            log_file=self.config.log_file,
-            element_tree=element_tree,
-            idx=target_ele.id,
-            inputs=text,
-            action_type='scroll down',
-            api_name=None,
-            xpath=None,
-            currently_executing_code=statement,
-            comment='navigate',
-            screenshot=state.pixels.copy())
-        self.env.execute_action(
-            target_ele,
-            **{
-                "action_type": "scroll",
-                "index": target_ele.local_id, # scroll down target element
-                "direction": 'down' # it happens nothing when it is not scrollable
-            })
-        time.sleep(WAIT_AFTER_ACTION_SECONDS)
-        self.update_state()
-        self.check_last_screen_html()
-        element_tree = self.element_tree
-        target_ele = element_tree.get_ele_by_xpath(xpath)
-      
+    # could not find a target element in the current UI, find in the dependencies
     if not target_ele:
-      # find the target element in the scroll down views
-      target_ele = self.scroll_and_find_target_ele(xpath, statement)
-
-      # could not find a target element in the current UI, find in the dependencies
-      if not target_ele:
-        state = self.state
-        element_tree = self.element_tree
+      state = self.state
+      element_tree = self.element_tree
+      
+      if api_name:
+        is_in_current_screen = self.doc.check_api_name_in_current_screen(api_name, element_tree.skeleton)
+        if is_in_current_screen:
+          # assume the target element is in the current screen
+          # but we still can't find it, so raise an error
+          raise XPathError(f'Not Exist {api_name}[{xpath}]', api_name, xpath)
+        # else:
+        # not in screen, try to navigate to the screen
+      
+      if not self.config.enable_dependency:
+        raise NotFoundError(f'Not found {api_name}[{xpath}]', api_name, xpath)
+      
+      ## navigating in dependency
+      # we have executed all the dependencies, but still not found the target element
+      counter = 0
+      while target_ele is None and counter < MAX_DEPENDENCE_WIDTH:
+        _, dependency_action = self.doc.get_dependency(api_name)
         
-        if api_name:
-          is_in_current_screen = self.doc.check_api_name_in_current_screen(api_name, element_tree.skeleton)
-          if is_in_current_screen:
-            # assume the target element is in the current screen
-            # but we still can't find it, so raise an error
-            raise XPathError(f'Not Exist {api_name}[{xpath}]', api_name, xpath)
-          # else:
-          # not in screen, try to navigate to the screen
+        if not dependency_action:
+          break
         
-        ## navigating in dependency
-        # we have executed all the dependencies, but still not found the target element
-        counter = 0
-        while target_ele is None and counter < MAX_DEPENDENCE_WIDTH:
-          _, dependency_action = self.doc.get_dependency(api_name)
-          
-          if not dependency_action:
-            break
-          
-          count = 0
-          for action_list in dependency_action[:MAX_DEPENDENCE_DEPTH]:
-            count += 1
+        count = 0
+        for action_list in dependency_action[:MAX_DEPENDENCE_DEPTH]:
+          count += 1
 
-            is_match = False
-            dep_id = -1
-            for idx, action in enumerate(reversed(action_list)):
-              state = self.state
-              element_tree = self.element_tree
-              
-              # try to find the target element in the current UI
-              target_ele = element_tree.get_ele_by_xpath(xpath)
-              if target_ele:
-                break
-              
-              current_screen_name = self.doc.get_screen_name_by_skeleton(element_tree.skeleton)
-              if action.screen_name != current_screen_name:
-                continue
-              
-              if action.action_type == 'back':
-                self.env.execute_action(
-                    None,
-                    **{
-                        "action_type": "navigate_back"
-                    })
-                time.sleep(WAIT_AFTER_ACTION_SECONDS)
-                self.update_state()
-                self.check_last_screen_html()
-                is_match = True
-                continue
-              
-              _action_xpath = self.doc.api_xpath.get(action.name, None)
-              if not _action_xpath:
-                continue
-              _target_ele = self.scroll_and_find_target_ele(_action_xpath, statement)
-              
-              if not _target_ele:
-                if is_match:
-                  break
-                else:
-                  continue
-
-              # execute the action
+          is_match = False
+          dep_id = -1
+          for idx, action in enumerate(reversed(action_list)):
+            state = self.state
+            element_tree = self.element_tree
+            
+            # try to find the target element in the current UI
+            target_ele = element_tree.get_ele_by_xpath(xpath)
+            if target_ele:
+              break
+            
+            current_screen_name = self.doc.get_screen_name_by_skeleton(element_tree.skeleton)
+            if action.screen_name != current_screen_name:
+              continue
+            
+            if action.action_type == 'back':
               is_match = True
               dep_id = idx
               _save2log(
                 save_path=self.save_path,
                 log_file=self.config.log_file,
                 element_tree=element_tree,
-                idx=_target_ele.id if _target_ele else None,
+                idx=None,
                 inputs=None,
-                action_type=action.action_type,
-                api_name=action.api_name,
-                xpath=_action_xpath,
+                action_type='back',
+                api_name=None,
+                xpath=None,
                 currently_executing_code=statement,
                 comment='navigate',
                 screenshot=state.pixels.copy())
-              
-              executable_action = convert_action(action.action_type, _target_ele, action.text)
-              # finding dependency can tolerate the action error
-              # if executable_action.get('action_type') == 'wait':
-              #   raise ActionError(f'Fail to {action.action_type}({action.api_name})', None, None, action.action_type, action.api_name)
-              self.env.execute_action(_target_ele, **executable_action)
+              self.env.execute_action(
+                  **{
+                      "action_type": "navigate_back"
+                  })
               time.sleep(WAIT_AFTER_ACTION_SECONDS)
               self.update_state()
               self.check_last_screen_html()
-
-            if dep_id >= len(action_list) - 1:
-              state = self.state
-              element_tree = self.element_tree
-              target_ele = element_tree.get_ele_by_xpath(xpath)              
-              break
-              # if target_ele is None, continue to find the next dependency
+              continue
             
-            # executed action and changed the screen, we need to find new dependency
-            if is_match:
-              break
+            _action_xpath = self.doc.api_xpath.get(action.name, None)
+            if not _action_xpath:
+              continue
+            _target_ele = self.find_and_scroll_target_ele(_action_xpath, statement)
+            
+            if not _target_ele:
+              if is_match:
+                break
+              else:
+                continue
 
-          if count == len(dependency_action):
-            # fail to solve the dependency
-            # target_ele still is None
+            # execute the action
+            is_match = True
+            dep_id = idx
+            _save2log(
+              save_path=self.save_path,
+              log_file=self.config.log_file,
+              element_tree=element_tree,
+              idx=_target_ele.id if _target_ele else None,
+              inputs=None,
+              action_type=action.action_type,
+              api_name=action.api_name,
+              xpath=_action_xpath,
+              currently_executing_code=statement,
+              comment='navigate',
+              screenshot=state.pixels.copy())
+            
+            executable_action = convert_action(action.action_type, _target_ele, action.text)
+            # finding dependency can tolerate the action error
+            # if executable_action.get('action_type') == 'wait':
+            #   raise ActionError(f'Fail to {action.action_type}({action.api_name})', None, None, action.action_type, action.api_name)
+            self.env.execute_action(**executable_action)
+            time.sleep(WAIT_AFTER_ACTION_SECONDS)
+            self.update_state()
+            self.check_last_screen_html()
+
+          if dep_id >= len(action_list) - 1:
+            state = self.state
+            element_tree = self.element_tree
+            target_ele = element_tree.get_ele_by_xpath(xpath)              
             break
+            # if target_ele is None, continue to find the next dependency
           
-          counter += 1
+          # executed action and changed the screen, we need to find new dependency
+          if is_match:
+            break
+
+        if count == len(dependency_action):
+          # fail to solve the dependency
+          # target_ele still is None
+          break
+        
+        counter += 1
       
     if target_ele:
-      _save2log(
-          save_path=self.save_path,
-          log_file=self.config.log_file,
-          element_tree=element_tree,
-          idx=target_ele.id if target_ele else None,
-          inputs=text,
-          action_type=action_type,
-          api_name=api_name,
-          xpath=xpath,
-          currently_executing_code=statement,
-          comment='action' if action_type else 'navigate',
-          screenshot=state.pixels.copy())
-      if not action_type: # navigating
-        return
-      
-      executable_action = convert_action(action_type, target_ele, text)
-      if executable_action.get('action_type') == 'wait':
-        raise ActionError(f'Fail to {action_type}({api_name})', None, None, action_type, api_name)
-      self.env.execute_action(target_ele, **executable_action)
-      time.sleep(WAIT_AFTER_ACTION_SECONDS)
-      self.update_state()
-      self.check_last_screen_html()
+      return target_ele
     else:
       _save2log(
           save_path=self.save_path,
           log_file=self.config.log_file,
           element_tree=element_tree,
           idx=None,
-          inputs=text,
-          action_type=action_type,
+          inputs=None,
+          action_type=None,
           api_name=api_name,
           xpath=xpath,
           currently_executing_code=statement,
           comment='crashed',
           screenshot=state.pixels.copy())
-      
-      if action_type: # only action can crash
-        raise NotFoundError(f'Not found {api_name}[{xpath}]', api_name, xpath)
-    return
+      raise NotFoundError(f'Not found {api_name}[{xpath}]', api_name, xpath)
+  
+  def _execute_action(self, api_object, statement, action_type, text: str=None):
+    if isinstance(api_object, str):
+      button_api_name = api_object.split('$')[-1]
+      api_name = button_api_name
+      try:
+        xpath = self.api_xpaths[button_api_name]
+      except KeyError:
+        _save2log( # save crash in get_and_navigate_target_element
+            save_path=self.save_path,
+            log_file=self.config.log_file,
+            element_tree=self.element_tree,
+            idx=None,
+            inputs=None,
+            action_type=action_type,
+            api_name=api_name,
+            xpath=None,
+            currently_executing_code=statement,
+            comment='crashed',
+            screenshot=self.state.pixels.copy())
+        raise APIError(f'Invalid {button_api_name}', button_api_name)
+    else:
+      api_name = api_object.api_name,
+      xpath = api_object.element_list_xpath
 
-  def navigate_and_get_target_element(self, element_selector_api_name, element_selector_xpath, caller_type,
-                                      statement):
-    state = self.state
-    element_tree = self.element_tree
-    
-    target_ele = element_tree.get_ele_by_xpath(element_selector_xpath)
-    
-    _save2log(
+    target_ele = self.get_and_navigate_target_element(api_name, xpath, statement)
+    _save2log( # save crash in get_and_navigate_target_element
         save_path=self.save_path,
         log_file=self.config.log_file,
-        element_tree=element_tree,
-        idx=target_ele.id if target_ele else None,
+        element_tree=self.element_tree,
+        idx=target_ele.id,
         inputs=None,
-        action_type=caller_type,
-        api_name=element_selector_api_name,
-        xpath=element_selector_xpath,
+        action_type=action_type,
+        api_name=api_name,
+        xpath=xpath,
         currently_executing_code=statement,
         comment='action',
-        screenshot=state.pixels.copy())
+        screenshot=self.state.pixels.copy())
     
-    if not target_ele:
-      ele_data = {
-          'xpath': element_selector_xpath,
-          'api_name': element_selector_api_name,
-          'text': None,
-          'action_type': None, # navigating
-          'statement': statement
-      }
-
-      self.execute_action(ele_data)
-      state = self.state
-      element_tree = self.element_tree
-      target_ele = element_tree.get_ele_by_xpath(element_selector_xpath)
-
-      if not target_ele:
-        raise NotFoundError(f'Not found {element_selector_api_name}[{element_selector_xpath}]', element_selector_api_name, element_selector_xpath)
-    return target_ele
-
+    executable_action = convert_action(action_type, target_ele, text)
+    self.env.execute_action(**executable_action)
+    time.sleep(WAIT_AFTER_ACTION_SECONDS)
+    self.update_state()
+    self.check_last_screen_html()
+    self.check_action_count()
+  
   def tap(self, button_api):
     # get the currently executing code
     code_lines = self.config.compiled_code_lines
@@ -628,32 +583,13 @@ class Verifier:
     lineno_in_original_script = self.config.line_mappings[lineno - 1]
     original_code_line = self.config.code_lines[lineno_in_original_script]
 
-    if isinstance(button_api, str):
-      button_api_name = button_api.split('$')[-1]
-      ele_data = {
-          'xpath': self.api_xpaths[button_api_name],
-          'api_name': button_api_name,
-          'text': None,
-          'action_type': 'touch',
-      }
-
-    else:
-      button_api_name = button_api.api_name if button_api.api_name else button_api.element_list_xpath
-
-      ele_data = {
-          'xpath': button_api.element_list_xpath,
-          'api_name': button_api.api_name,
-          'text': None,
-          'action_type': 'touch',
-          'statement': {
-              'current_code': current_code_line,
-              'original_lineno': lineno_in_original_script,
-              'original_code': original_code_line
-          }
-      }
-
-    self.execute_action(ele_data)
-    self.check_action_count()
+    action_type = 'touch'
+    statement = {
+        'current_code': current_code_line,
+        'original_lineno': lineno_in_original_script,
+        'original_code': original_code_line
+    }
+    self._execute_action(button_api, statement, action_type)
 
   def long_tap(self, button_api):
     # get the currently executing code
@@ -668,74 +604,32 @@ class Verifier:
     lineno_in_original_script = self.config.line_mappings[lineno - 1]
     original_code_line = self.config.code_lines[lineno_in_original_script]
 
-    if isinstance(button_api, str):
-      button_api_name = button_api.split('$')[-1]
-      ele_data = {
-          'xpath': self.api_xpaths[button_api_name],
-          'api_name': button_api_name,
-          'text': None,
-          'action_type': 'touch'
-      }
+    action_type = 'touch'
+    statement = {
+        'current_code': current_code_line,
+        'original_lineno': lineno_in_original_script,
+        'original_code': original_code_line
+    }
+    self._execute_action(button_api, statement, action_type)
 
-    else:
-      # this button is a component from an element list, so it already exists in the UI
-      if isinstance(button_api, list):
-        button_api = button_api[0]
-      button_api_name = button_api.api_name if button_api.api_name else button_api.element_list_xpath
-
-      ele_data = {
-          'xpath': button_api.element_list_xpath,
-          'api_name': button_api.api_name,
-          'text': None,
-          'action_type': 'long_touch',
-          'statement': {
-              'current_code': current_code_line,
-              'original_lineno': lineno_in_original_script,
-              'original_code': original_code_line
-          }
-      }
-
-    self.execute_action(ele_data)
-    self.check_action_count()
-
-  def set_text(self, text_api, text):
+  def set_text(self, input_api, text):
     # get the currently executing code
     code_lines = self.config.compiled_code_lines
     frame = inspect.currentframe()
     caller_frame = frame.f_back
     lineno = caller_frame.f_lineno
-    print(f"set_text: {text_api} at line {lineno}, code is:{code_lines[lineno - 1]}, action count: {self.action_count}")
+    print(f"set_text: {input_api} at line {lineno}, code is:{code_lines[lineno - 1]}, action count: {self.action_count}")
     current_code_line = code_lines[lineno - 1]
     lineno_in_original_script = self.config.line_mappings[lineno - 1]
     original_code_line = self.config.code_lines[lineno_in_original_script]
 
-    if isinstance(text_api, str):
-      text_api_name = text_api.split('$')[-1]
-      ele_data = {
-          'xpath': self.api_xpaths[text_api_name],
-          'api_name': text_api_name,
-          'text': text,
-          'action_type': 'set_text'
-      }
-    else:
-      if isinstance(text_api, list):
-        text_api = text_api[0]
-      text_api_name = text_api.api_name if text_api.api_name else text_api.element_list_xpath
-
-      ele_data = {
-          'xpath': text_api.element_list_xpath,
-          'api_name': None,
-          'text': text,
-          'action_type': 'set_text',
-          'statement': {
-              'current_code': current_code_line,
-              'original_lineno': lineno_in_original_script,
-              'original_code': original_code_line
-          }
-      }
-
-    self.execute_action(ele_data)
-    self.check_action_count()
+    action_type = 'set_text'
+    statement = {
+        'current_code': current_code_line,
+        'original_lineno': lineno_in_original_script,
+        'original_code': original_code_line
+    }
+    self._execute_action(input_api, statement, action_type, text)
 
   def scroll(self, scroller_api, direction):
     # get the currently executing code
@@ -750,46 +644,24 @@ class Verifier:
 
     last_screen = self.last_screen
     
-    if isinstance(scroller_api, str):
-      scroller_api_name = scroller_api.split('$')[-1]
-      if 'up' in direction.lower():
-        direction_str = 'up'
-      elif 'down' in direction.lower():
-        direction_str = 'down'
-      elif 'left' in direction.lower():
-        direction_str = 'left'
-      elif 'right' in direction.lower():
-        direction_str = 'right'
-      else:
-        direction_str = 'down'
-      ele_data = {
-          'xpath': self.api_xpaths[scroller_api_name],
-          'api_name': scroller_api_name,
-          'text': None,
-          'action_type': f'scroll {direction_str}'
-      }
+    statement = {
+        'current_code': current_code_line,
+        'original_lineno': lineno_in_original_script,
+        'original_code': original_code_line
+    }
+    if 'up' in direction.lower():
+      direction_str = 'up'
+    elif 'down' in direction.lower():
+      direction_str = 'down'
+    elif 'left' in direction.lower():
+      direction_str = 'left'
+    elif 'right' in direction.lower():
+      direction_str = 'right'
     else:
-      # this button is a component from an element list, so it already exists in the UI
-      if isinstance(scroller_api, list):
-        scroller_api = scroller_api[0]
-      scroller_api_name = scroller_api.api_name if scroller_api.api_name else scroller_api.element_list_xpath
-      direction_str = 'up' if 'up' in direction.lower() else 'down'
-
-      ele_data = {
-          'xpath': scroller_api.element_list_xpath,
-          'api_name': scroller_api_name,
-          'text': None,
-          'action_type': f'scroll {direction_str}',
-          'statement': {
-              'current_code': current_code_line,
-              'original_lineno': lineno_in_original_script,
-              'original_code': original_code_line
-          }
-      }
-
-    self.execute_action(ele_data)
-    self.check_last_screen_html()
-    self.check_action_count()
+      direction_str = 'down'
+    action_type = f'scroll {direction_str}'
+    
+    self._execute_action(scroller_api, statement, action_type)
     is_to_bottom = False if not last_screen else self.last_screen == last_screen
     return is_to_bottom
 
@@ -808,6 +680,11 @@ class Verifier:
     lineno_in_original_script = self.config.line_mappings[lineno - 1]
     original_code_line = self.config.code_lines[lineno_in_original_script]
 
+    statement={
+        'current_code': current_code_line,
+        'original_lineno': lineno_in_original_script,
+        'original_code': original_code_line
+    }
     # for actions like getting length, indexing, or matching, the element_selector is a string
     if isinstance(element_selector, str):
       element_selector = element_selector.split('$')[-1]
@@ -820,15 +697,22 @@ class Verifier:
       element_selector_xpath = element_selector.element_list_xpath
       element_selector_api_name = element_selector.api_name if element_selector.api_name else element_selector.element_list_xpath
     
-    target_ele = self.navigate_and_get_target_element(
+    target_ele = self.get_and_navigate_target_element(
         element_selector_api_name,
         element_selector_xpath,
-        caller_type='get_text',
-        statement={
-            'current_code': current_code_line,
-            'original_lineno': lineno_in_original_script,
-            'original_code': original_code_line
-        })
+        statement)
+    
+    _save2log(
+        save_path=self.save_path,
+        log_file=self.config.log_file,
+        element_tree=self.element_tree,
+        idx=target_ele.id,
+        inputs=None,
+        action_type='get_text',
+        api_name=element_selector_api_name,
+        xpath=element_selector_xpath,
+        currently_executing_code=statement,
+        screenshot=None) # same as the current screen
     
     self.check_action_count()
     # not change the status
@@ -852,6 +736,11 @@ class Verifier:
     lineno_in_original_script = self.config.line_mappings[lineno - 1]
     original_code_line = self.config.code_lines[lineno_in_original_script]
 
+    statement={
+        'current_code': current_code_line,
+        'original_lineno': lineno_in_original_script,
+        'original_code': original_code_line
+    }
     # for actions like getting length, indexing, or matching, the element_selector is a string
     if isinstance(element_selector, str):
       element_selector = element_selector.split('$')[-1]
@@ -864,15 +753,22 @@ class Verifier:
       element_selector_xpath = element_selector.element_list_xpath
       element_selector_api_name = element_selector.api_name if element_selector.api_name else element_selector.element_list_xpath
     
-    target_ele = self.navigate_and_get_target_element(
+    target_ele = self.get_and_navigate_target_element(
         element_selector_api_name,
         element_selector_xpath,
-        caller_type='get_attributes',
-        statement={
-            'current_code': current_code_line,
-            'original_lineno': lineno_in_original_script,
-            'original_code': original_code_line
-        })
+        statement)
+    
+    _save2log(
+        save_path=self.save_path,
+        log_file=self.config.log_file,
+        element_tree=self.element_tree,
+        idx=target_ele.id,
+        inputs=None,
+        action_type='get_attributes',
+        api_name=element_selector_api_name,
+        xpath=element_selector_xpath,
+        currently_executing_code=statement,
+        screenshot=None) # same as the current screen
     
     self.check_action_count()
     # not change the screen
@@ -891,7 +787,7 @@ class Verifier:
     frame = inspect.currentframe()
     caller_frame = frame.f_back
     lineno = caller_frame.f_lineno
-    print(f"go back at line {lineno}, code is:{code_lines[lineno - 1]}, action count: {self.action_count}")
+    print(f"back at line {lineno}, code is:{code_lines[lineno - 1]}, action count: {self.action_count}")
     current_code_line = code_lines[lineno - 1]
     lineno_in_original_script = self.config.line_mappings[lineno - 1]
     original_code_line = self.config.code_lines[lineno_in_original_script]
@@ -905,7 +801,7 @@ class Verifier:
         element_tree=element_tree,
         idx=None,
         inputs=None,
-        action_type='go back',
+        action_type='back',
         api_name=None,
         xpath=None,
         currently_executing_code={
@@ -915,13 +811,13 @@ class Verifier:
         },
         screenshot=state.pixels.copy())
 
-    self.env.execute_action(None, **{"action_type": "navigate_back"})
+    self.env.execute_action(**{"action_type": "navigate_back"})
     time.sleep(WAIT_AFTER_ACTION_SECONDS)
     self.update_state()
     
     screen_name = self.doc.get_screen_name_by_skeleton(element_tree.skeleton)
     if not screen_name: # out of the app
-      self.env.execute_action(None, **{"action_type": "open_app", "app_name": self.app_name})
+      self.env.execute_action(**{"action_type": "open_app", "app_name": self.app_name})
       time.sleep(WAIT_AFTER_ACTION_SECONDS)
       self.update_state()
     
@@ -1001,7 +897,19 @@ class ElementList:
             'original_code': original_code_line
         }
     
-    target_ele_group = self.verifier.navigate_and_get_target_element(element_selector_api_name, element_selector_xpath, f'index[{selector}]', statement)
+    target_ele_group = self.verifier.get_and_navigate_target_element(element_selector_api_name, element_selector_xpath, statement)
+    
+    _save2log(
+        save_path=self.save_path,
+        log_file=self.config.log_file,
+        element_tree=self.element_tree,
+        idx=target_ele_group.id,
+        inputs=selector,
+        action_type=f'__index__',
+        api_name=element_selector_api_name,
+        xpath=element_selector_xpath,
+        currently_executing_code=statement,
+        screenshot=None)
     
     # Default to integer index if not a custom selector
     if isinstance(selector, int):
@@ -1039,7 +947,19 @@ class ElementList:
             'original_code': original_code_line
         }
     
-    target_ele_group= self.verifier.navigate_and_get_target_element(element_selector_api_name, element_selector_xpath, f'[{self.index}]next', statement)
+    target_ele_group= self.verifier.get_and_navigate_target_element(element_selector_api_name, element_selector_xpath, statement)
+    
+    _save2log(
+        save_path=self.save_path,
+        log_file=self.config.log_file,
+        element_tree=self.element_tree,
+        idx=target_ele_group.id,
+        inputs=self.index,
+        action_type='__next__',
+        api_name=element_selector_api_name,
+        xpath=element_selector_xpath,
+        currently_executing_code=statement,
+        screenshot=None)
 
     ele_list_children = self.element_tree.get_children_by_ele(target_ele_group)
     if not ele_list_children:
@@ -1070,8 +990,20 @@ class ElementList:
             'original_code': original_code_line
         }
     
-    target_ele = self.verifier.navigate_and_get_target_element(element_selector_api_name, element_selector_xpath, f'match[{match_data}]', statement)
+    target_ele = self.verifier.get_and_navigate_target_element(element_selector_api_name, element_selector_xpath, statement)
 
+    _save2log(
+        save_path=self.save_path,
+        log_file=self.config.log_file,
+        element_tree=self.element_tree,
+        idx=target_ele.id,
+        inputs=match_data,
+        action_type='match',
+        api_name=element_selector_api_name,
+        xpath=element_selector_xpath,
+        currently_executing_code=statement,
+        screenshot=None)
+    
     ele_list_children = self.element_tree.get_children_by_ele(target_ele)
     
     matched_elements, matched_xpaths = [], []
@@ -1111,8 +1043,20 @@ class ElementList:
             'original_code': original_code_line
         }
     
-    target_ele = self.verifier.navigate_and_get_target_element(element_selector_api_name, element_selector_xpath, '__len__', statement)
+    target_ele = self.verifier.get_and_navigate_target_element(element_selector_api_name, element_selector_xpath, '__len__', statement)
 
+    _save2log(
+        save_path=self.save_path,
+        log_file=self.config.log_file,
+        element_tree=self.element_tree,
+        idx=target_ele.id,
+        inputs=None,
+        action_type='__len__',
+        api_name=element_selector_api_name,
+        xpath=element_selector_xpath,
+        currently_executing_code=statement,
+        screenshot=None)
+    
     if not target_ele: # todo:: maybe it's 0
       logging.warning(f'not found {self.api_name}[{self.element_list_xpath}]')
       return 0
@@ -1133,37 +1077,83 @@ class ElementList:
 
     return current_code_line, lineno_in_original_script, original_code_line
 
-  def find_target_element_in_group(self, element_selector_api_name: str, element_selector_xpath: str, caller_type: str, statement: dict):
+  def find_target_element_in_group(self, element_selector_api_name: str, element_selector_xpath: str, statement: dict):
     
     target_ele = None
     element_tree = self.element_tree
-    target_ele_group = self.verifier.navigate_and_get_target_element(self.api_name, self.element_list_xpath, caller_type, statement)
+    target_ele_group = self.verifier.get_and_navigate_target_element(self.api_name, self.element_list_xpath, statement)
     subtree = element_tree.extract_subtree(target_ele_group.id)
     if subtree:
       target_ele = subtree.get_ele_by_xpath(element_selector_xpath)
 
     if not target_ele:
+      _save2log(
+          save_path=self.save_path,
+          log_file=self.config.log_file,
+          element_tree=element_tree,
+          idx=target_ele_group.id,
+          inputs=None,
+          action_type='find_target_element_in_group',
+          api_name=element_selector_api_name,
+          xpath=element_selector_xpath,
+          currently_executing_code=statement,
+          comment='crashed',
+          screenshot=element_tree.pixels.copy())
       if self.doc.check_api_name_in_current_screen(element_selector_api_name, self.element_tree.skeleton):
         raise XPathError(f'Not Exist {element_selector_api_name}[{element_selector_xpath}]', element_selector_api_name, element_selector_xpath)
       else:
         raise NotFoundError(f'Not Found {element_selector_api_name}[{element_selector_xpath}] in {self.api_name}[{self.element_list_xpath}]', element_selector_api_name, element_selector_xpath, self.api_name, self.element_list_xpath)
     
     return target_ele
+  
+  def _execute_action(self, element_selector, statement, action_type, text: str=None):
+    if isinstance(element_selector, str):
+      element_selector_name = element_selector.split('$')[-1]
+      try:
+        element_selector_xpath = self.api_xpaths[element_selector_name]
+      except KeyError:
+        _save2log( # save crash in get_and_navigate_target_element
+            save_path=self.save_path,
+            log_file=self.config.log_file,
+            element_tree=self.element_tree,
+            idx=None,
+            inputs=None,
+            action_type=action_type,
+            api_name=element_selector_name,
+            xpath=None,
+            currently_executing_code=statement,
+            comment='crashed',
+            screenshot=self.state.pixels.copy())
+        raise APIError(f'Invalid {element_selector_name}', element_selector_name)
+    else:
+      element_selector_name = element_selector.api_name if element_selector.api_name else element_selector.element_list_xpath
+      element_selector_xpath = element_selector.element_list_xpath
+    
+    target_ele = self.find_target_element_in_group(element_selector_name, element_selector_xpath, statement)
+    _save2log(
+        save_path=self.save_path,
+        log_file=self.config.log_file,
+        element_tree=self.element_tree,
+        idx=target_ele.id,
+        inputs=None,
+        action_type=action_type,
+        api_name=element_selector_name,
+        xpath=element_selector_xpath,
+        currently_executing_code=statement,
+        comment='action',
+        screenshot=self.state.pixels.copy())
+    
+    executable_action = convert_action(action_type, target_ele, text)
+    self.env.execute_action(**executable_action)
+    time.sleep(WAIT_AFTER_ACTION_SECONDS)
+    self.update_state()
+    self.check_last_screen_html()
+    self.check_action_count()
     
   def tap(self, button_api):
     frame = inspect.currentframe()
     caller_frame = frame.f_back
     lineno = caller_frame.f_lineno
-    
-    if isinstance(button_api, str):
-      button_api_name = button_api.split('$')[-1]
-      button_api_xpath = self.api_xpaths[button_api_name]
-    elif isinstance(button_api, ElementList):
-      button_api_name = button_api.api_name if button_api.api_name else button_api.element_list_xpath
-      button_api_xpath = button_api.element_list_xpath
-    else:
-      raise APIError(f'Invalid {button_api}', button_api)
-
     current_code_line, lineno_in_original_script, original_code_line = self.get_current_code_line(lineno, 'touch', button_api_name)
     statement = {
             'current_code': current_code_line,
@@ -1171,34 +1161,13 @@ class ElementList:
             'original_code': original_code_line
         }
     
-    target_ele = self.find_target_element_in_group(button_api_name, button_api_xpath, 'touch', statement)
-
-    converted_action = convert_action("touch", target_ele)
-    if converted_action['action_type'] == 'wait':
-      raise ActionError(f'Fail to tap({button_api_name}) in {self.api_name}[{self.element_list_xpath}]', self.api_name, self.element_list_xpath, 'touch', button_api_name)
-    
-    self.env.execute_action(target_ele, **converted_action)
-    time.sleep(WAIT_AFTER_ACTION_SECONDS)
-    self.update_state()
-    self.check_last_screen_html()
-    
-    self.check_action_count()
+    action_type = 'touch'
+    self._execute_action(button_api, statement, action_type)
 
   def long_tap(self, button_api):
     frame = inspect.currentframe()
     caller_frame = frame.f_back
     lineno = caller_frame.f_lineno
-    
-    if isinstance(button_api, str):
-      button_api_name = button_api.split('$')[-1]
-      button_api_xpath = self.api_xpaths[button_api_name]
-    elif isinstance(button_api, ElementList):
-      button_api_name = button_api.api_name if button_api.api_name else button_api.element_list_xpath
-      button_api_xpath = button_api.element_list_xpath
-    else:
-      raise APIError(f'Invalid {button_api}', button_api)
-    
-    
     current_code_line, lineno_in_original_script, original_code_line = self.get_current_code_line(lineno, 'long_touch', button_api_name)
     statement = {
             'current_code': current_code_line,
@@ -1206,33 +1175,13 @@ class ElementList:
             'original_code': original_code_line
         }
     
-    target_ele = self.find_target_element_in_group(button_api_name, button_api_xpath, 'long_touch', statement)
-
-    converted_action = convert_action("long_touch", target_ele)
-    if converted_action['action_type'] == 'wait':
-      raise ActionError(f'Fail to long_tap({button_api_name}) in {self.api_name}[{self.element_list_xpath}]', self.api_name, self.element_list_xpath, 'long_touch', button_api_name)
-    
-    self.env.execute_action(target_ele, **converted_action)
-    time.sleep(WAIT_AFTER_ACTION_SECONDS)
-    self.update_state()
-    self.check_last_screen_html()
-    
-    self.check_action_count()
+    action_type = 'long_touch'
+    self._execute_action(button_api, statement, action_type)
 
   def set_text(self, input_api, text):
     frame = inspect.currentframe()
     caller_frame = frame.f_back
     lineno = caller_frame.f_lineno
-    
-    if isinstance(input_api, str):
-      input_api_name = input_api.split('$')[-1]
-      input_api_xpath = self.api_xpaths[input_api_name] # todo:: if multiple, we can try step by step
-    elif isinstance(input_api, ElementList):
-      input_api_name = input_api.api_name if input_api.api_name else input_api.element_list_xpath
-      input_api_xpath = input_api.element_list_xpath
-    else:
-      raise APIError(f'Invalid {input_api}', input_api)
-    
     current_code_line, lineno_in_original_script, original_code_line = self.get_current_code_line(lineno, 'set_text', input_api_name)
     statement = {
             'current_code': current_code_line,
@@ -1240,18 +1189,8 @@ class ElementList:
             'original_code': original_code_line
         }
     
-    target_ele = self.find_target_element_in_group(input_api_name, input_api_xpath, 'set_text', statement)
-
-    converted_action = convert_action("set_text", target_ele, text)
-    if converted_action['action_type'] == 'wait':
-      raise ActionError(f'Fail to set_text({input_api}) in {self.api_name}[{self.element_list_xpath}]', self.api_name, self.element_list_xpath, 'set_text', input_api)
-    
-    self.env.execute_action(target_ele, **converted_action)
-    time.sleep(WAIT_AFTER_ACTION_SECONDS)
-    self.update_state()
-    self.check_last_screen_html()
-    
-    self.check_action_count()
+    action_type = 'set_text'
+    self._execute_action(input_api, statement, action_type, text)
 
   def get_text(self, element_selector):
     '''
@@ -1260,17 +1199,6 @@ class ElementList:
     frame = inspect.currentframe()
     caller_frame = frame.f_back
     lineno = caller_frame.f_lineno
-    
-    if isinstance(element_selector, str):
-      element_selector = element_selector.split('$')[-1]
-      element_selector_xpath = self.api_xpaths[element_selector]
-      element_selector_api_name = element_selector
-    elif isinstance(element_selector, ElementList):
-      element_selector_xpath = element_selector.element_list_xpath
-      element_selector_api_name = element_selector.api_name if element_selector.api_name else element_selector.element_list_xpath
-    else:
-      raise APIError(f'Invalid {element_selector}', element_selector)
-    
     current_code_line, lineno_in_original_script, original_code_line = self.get_current_code_line(lineno, 'get_text', element_selector_api_name)
     statement = {
             'current_code': current_code_line,
@@ -1278,8 +1206,42 @@ class ElementList:
             'original_code': original_code_line
         }
     
-    target_ele = self.find_target_element_in_group(element_selector_api_name, element_selector_xpath, 'get_text', statement)
+    action_type = 'get_text'
+    if isinstance(element_selector, str):
+      element_selector_name = element_selector.split('$')[-1]
+      try:
+        element_selector_xpath = self.api_xpaths[element_selector_name]
+      except KeyError:
+        _save2log( # save crash in get_and_navigate_target_element
+            save_path=self.save_path,
+            log_file=self.config.log_file,
+            element_tree=self.element_tree,
+            idx=None,
+            inputs=None,
+            action_type=action_type,
+            api_name=element_selector_name,
+            xpath=None,
+            currently_executing_code=statement,
+            comment='crashed',
+            screenshot=self.state.pixels.copy())
+        raise APIError(f'Invalid {element_selector_name}', element_selector_name)
+    else:
+      element_selector_name = element_selector.api_name if element_selector.api_name else element_selector.element_list_xpath
+      element_selector_xpath = element_selector.element_list_xpath
     
+    target_ele = self.find_target_element_in_group(element_selector_name, element_selector_xpath, 'get_text', statement)
+    
+    _save2log(
+        save_path=self.save_path,
+        log_file=self.config.log_file,
+        element_tree=self.element_tree,
+        idx=target_ele.id,
+        inputs=None,
+        action_type=action_type,
+        api_name=element_selector_name,
+        xpath=element_selector_xpath,
+        currently_executing_code=statement,
+        screenshot=None)
     self.check_action_count()
     # not change screen
     
@@ -1294,17 +1256,6 @@ class ElementList:
     frame = inspect.currentframe()
     caller_frame = frame.f_back
     lineno = caller_frame.f_lineno
-    
-    if isinstance(element_selector, str):
-      element_selector = element_selector.split('$')[-1]
-      element_selector_xpath = self.api_xpaths[element_selector]
-      element_selector_api_name = element_selector
-    elif isinstance(element_selector, ElementList):
-      element_selector_xpath = element_selector.element_list_xpath
-      element_selector_api_name = element_selector.api_name if element_selector.api_name else element_selector.element_list_xpath
-    else:
-      raise APIError(f'Invalid {element_selector}', element_selector)
-    
     current_code_line, lineno_in_original_script, original_code_line = self.get_current_code_line(lineno, 'get_attributes', element_selector_api_name)
     statement = {
             'current_code': current_code_line,
@@ -1312,12 +1263,47 @@ class ElementList:
             'original_code': original_code_line
         }
     
-    target_ele = self.find_target_element_in_group(element_selector_api_name, element_selector_xpath, 'get_attributes', statement)
+    action_type = 'get_attributes'
+    if isinstance(element_selector, str):
+      element_selector_name = element_selector.split('$')[-1]
+      try:
+        element_selector_xpath = self.api_xpaths[element_selector_name]
+      except KeyError:
+        _save2log( # save crash in get_and_navigate_target_element
+            save_path=self.save_path,
+            log_file=self.config.log_file,
+            element_tree=self.element_tree,
+            idx=None,
+            inputs=None,
+            action_type=action_type,
+            api_name=element_selector_name,
+            xpath=None,
+            currently_executing_code=statement,
+            comment='crashed',
+            screenshot=self.state.pixels.copy())
+        raise APIError(f'Invalid {element_selector_name}', element_selector_name)
+    else:
+      element_selector_name = element_selector.api_name if element_selector.api_name else element_selector.element_list_xpath
+      element_selector_xpath = element_selector.element_list_xpath
     
+    target_ele = self.find_target_element_in_group(element_selector_name, element_selector_xpath, 'get_text', statement)
+    
+    _save2log(
+        save_path=self.save_path,
+        log_file=self.config.log_file,
+        element_tree=self.element_tree,
+        idx=target_ele.id,
+        inputs=None,
+        action_type=action_type,
+        api_name=element_selector_name,
+        xpath=element_selector_xpath,
+        currently_executing_code=statement,
+        screenshot=None)
     self.check_action_count()
     # not change screen
     target_ele_attrs = target_ele.get_attributes()
-    target_ele_attrs['text'] = target_ele_attrs.replace('--', ' ')
+    if target_ele_attrs['text']:
+      target_ele_attrs['text'] = target_ele_attrs['text'].replace('--', ' ')
     return target_ele_attrs
   
   def scroll(self, scroller_api, direction):
